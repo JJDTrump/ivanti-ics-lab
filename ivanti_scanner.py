@@ -459,7 +459,21 @@ class IvantiScanner:
         if r and r.status_code == 200 and ("Invalid" in r.text or "error" in r.text.lower()):
             self._hit("ZD-09", "OAuth SSRF to localhost:7300",
                       "medium", "state param forwarded to internal OIDC service")
-            return True
+
+        # ZD-18: Pre-auth open redirect via OIDC response reflection
+        # If OIDC(7300) is running, state param is reflected in error response
+        # oauth-consumer.cgi extracts URL with index("http")/rindex('"') and redirects
+        r2 = self._get("/dana-na/auth/oauth-consumer.cgi",
+                        params={"state": "http://evil.example.com/redirect-test"})
+        if r2 and r2.status_code == 302:
+            loc = r2.headers.get("Location", "")
+            if "evil.example.com" in loc:
+                self._hit("ZD-18", "Pre-Auth Open Redirect via OAuth OIDC Reflection",
+                          "high",
+                          f"state=http://evil.com → Location: {loc}. OIDC reflects state in error, "
+                          f"oauth-consumer.cgi extracts with index('http')/rindex('\"') and redirects.",
+                          data={"location": loc})
+                return True
         return False
 
     def check_path_traversal(self):
